@@ -126,6 +126,14 @@ if (process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY) {
   const { port, close } = await startProxy();
   env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
   env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
+  // A custom ANTHROPIC_BASE_URL makes Claude Code turn tool search off and send every MCP
+  // tool schema on every request (measured: ~37k extra tokens per call with a few claude.ai
+  // connectors). The proxy forwards to Anthropic, so tool search works and stays on.
+  env.ENABLE_TOOL_SEARCH ??= "true";
+  // "jev-router" is an unknown model to Claude Code, which then assumes a 200k window and
+  // auto-compacts early. The routed tiers other than Haiku have 1M; the proxy steps Haiku
+  // up when a request would not fit its 200k.
+  env.CLAUDE_CODE_MAX_CONTEXT_TOKENS ??= "1000000";
   Object.assign(env, autoModelEnv());
   process.on("exit", () => {
     close();

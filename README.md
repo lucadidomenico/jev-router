@@ -4,6 +4,30 @@ Automatic per-turn model routing for Claude Code and OpenAI Codex. Jev sends sim
 the fast tier and difficult work to the strong tier, while preserving each CLI's native
 interface, tools, sessions, permissions, and authentication.
 
+> **About this fork.** Branch `claude-code-fixes` is jev-router 0.3.0 with fixes for
+> Claude Code 2.1.28x, used for [this experiment](https://github.com/lucadidomenico/jev-router-esperimento).
+> Without them, Jev is never asked on Claude Code 2.1.28x and the session stays on the default model.
+>
+> 1. A trailing `role: "system"` message (added by Claude Code 2.1.28x) no longer hides the
+>    user turn, so Jev is actually asked (same fix as upstream #28 / PR #36).
+> 2. Haiku 4.5 rejects `role: "system"` messages: for Haiku they are folded into the user message.
+> 3. Haiku 4.5 and Sonnet 5 reject `tool_addition`/`tool_removal` blocks: for them the loaded tools
+>    become regular tools.
+> 4. A request that would not fit Haiku's 200k window steps up to Sonnet.
+> 5. `jev-claude` sets `ENABLE_TOOL_SEARCH=true` (a custom `ANTHROPIC_BASE_URL` turns tool search
+>    off, about 37k extra tokens per call in our setup) and `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`
+>    (otherwise the unknown model `jev-router` gets a 200k window and compacts early).
+> 6. Prompts Claude Code writes itself (suggestions, recaps) are not routed.
+> 7. The `opus` tier is `claude-opus-5-5`; new options `JEV_START_TIER` (starting tier, default
+>    `opus`) and `JEV_PIN_MODELS=1` (always use the built-in model ids).
+>
+> ```bash
+> git clone -b claude-code-fixes https://github.com/lucadidomenico/jev-router
+> cd jev-router && npm install
+> echo "JEV_API_KEY=..." > ~/.jev-router.env
+> node bin/jev-claude.mjs          # instead of jev-claude; JEV_DEBUG=1 logs every decision
+> ```
+
 | Command | Interface | Authentication | Routing decision |
 | --- | --- | --- | --- |
 | `jev-claude` | Claude Code | Existing `claude login` | Status line |

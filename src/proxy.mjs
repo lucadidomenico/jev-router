@@ -17,6 +17,10 @@ import { log } from "./log.mjs";
 import { writeDecision, writeStatus } from "./status.mjs";
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+/** Openings of prompts Claude Code writes itself for background forks, never typed by the user. */
+const INTERNAL_PROMPTS = [/^\[SUGGESTION MODE\b/, /^The user stepped away and is coming back\b/];
+/** Haiku 4.5 has a 200k window; leave headroom for the output and the chars/4 estimate. */
+const HAIKU_MAX_TOKENS = 170000;
 const debug = (line) => process.env.JEV_DEBUG && log(line);
 
 /**
@@ -54,7 +58,9 @@ export function sanitizeSchema(node) {
  */
 export function newTurnPrompt(body) {
   if (!Array.isArray(body?.tools) || body.tools.length === 0) return null; // auxiliary call
-  const last = body?.messages?.[body.messages.length - 1];
+  // Claude Code 2.1.28x appends the environment block as a trailing `system` message after
+  // the user's prompt, so the turn is identified by the last non-system message.
+  const last = body?.messages?.findLast((m) => m.role !== "system");
   if (!last || last.role !== "user") return null;
   let text;
   if (typeof last.content === "string") {
@@ -68,7 +74,13 @@ export function newTurnPrompt(body) {
   } else {
     return null;
   }
-  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim() || null;
+  const prompt = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+  // Claude Code's own background forks (next-prompt suggestions, "while you were away"
+  // recaps) arrive as user text with tools attached. Routing them would spend a Jev call and
+  // move the conversation's model without the user typing anything, so they reuse the
+  // current one.
+  if (INTERNAL_PROMPTS.some((re) => re.test(prompt))) return null;
+  return prompt || null;
 }
 
 /**
@@ -94,7 +106,56 @@ export function applyTier(body, tierName, model = idOf(tierName)) {
     delete body.output_config.effort;
     if (Object.keys(body.output_config).length === 0) delete body.output_config;
   }
+  if (!tier.inlineTools && Array.isArray(body.messages)) inlineToolReferences(body);
+  if (!tier.systemMessages && Array.isArray(body.messages)) foldSystemMessages(body);
   return body;
+}
+
+/**
+ * With tool search on, Claude Code announces loaded tools as `tool_addition` /
+ * `tool_removal` blocks inside system messages, which only some models accept (400 "not
+ * supported on this model"). For the others, drop the blocks and load the referenced
+ * tools up front instead, so the model still sees them.
+ */
+export function inlineToolReferences(body) {
+  const loaded = new Set();
+  for (const m of body.messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      const name = b?.tool?.name;
+      if (b?.type === "tool_addition" && name) loaded.add(name);
+      if (b?.type === "tool_removal" && name) loaded.delete(name);
+    }
+    m.content = m.content.filter((b) => b?.type !== "tool_addition" && b?.type !== "tool_removal");
+  }
+  body.messages = body.messages.filter((m) => !Array.isArray(m.content) || m.content.length > 0);
+  for (const t of body.tools ?? []) {
+    if (loaded.has(t.name)) delete t.defer_loading;
+  }
+}
+
+/**
+ * Haiku rejects `role: "system"` inside `messages` (400 "role 'system' is not supported on
+ * this model"), which Claude Code 2.1.28x uses for its environment block. Fold each one into
+ * the neighbouring user message as a text block, keeping roles alternating.
+ */
+export function foldSystemMessages(body) {
+  const out = [];
+  for (const m of body.messages) {
+    if (m.role !== "system") {
+      out.push(m);
+      continue;
+    }
+    const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content;
+    const prev = out[out.length - 1];
+    if (prev?.role === "user") {
+      if (typeof prev.content === "string") prev.content = [{ type: "text", text: prev.content }];
+      prev.content = [...prev.content, ...blocks];
+    } else {
+      out.push({ role: "user", content: blocks });
+    }
+  }
+  body.messages = out;
 }
 
 /** Exact Claude models reported by the account, newest first; static ids are the cold-start fallback. */
@@ -110,7 +171,9 @@ export function claudeModels(catalog = []) {
         model.max_input_tokens && `${model.max_input_tokens} input tokens`,
       ].filter(Boolean).join("; "),
     }));
-  return models.length
+  // JEV_PIN_MODELS=1 keeps exactly one model per tier (the ids in TIERS), ignoring older
+  // versions the account also reports.
+  return models.length && process.env.JEV_PIN_MODELS !== "1"
     ? models
     : TIERS.map((tier) => ({ id: tier.id, tier: tier.name, description: tier.id }));
 }
@@ -213,7 +276,7 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             const key = conversationKey(body);
             const state = stateFor(key);
             // What the prompt cache was built on, which is what a downgrade would discard.
-            const current = state.tier ?? "opus";
+            const current = state.tier ?? (process.env.JEV_START_TIER || "opus");
             const prompt = newTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>");
             let fresh = null;
@@ -257,8 +320,17 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
             }
             // The sentinel is not a real model, so every routed request must be rewritten,
             // including follow-ups that reuse the tier chosen for the turn.
-            const tier = state.tier ?? current;
-            const model = state.model ?? idOf(tier);
+            let tier = state.tier ?? current;
+            let model = state.model ?? idOf(tier);
+            // Haiku's window is 200k while Claude Code may run with a 1M window
+            // (CLAUDE_CODE_MAX_CONTEXT_TOKENS), so a request that no longer fits steps up to
+            // sonnet for the rest of the turn instead of failing with "prompt is too long".
+            const approxTokens = Math.round(JSON.stringify(body).length / 4);
+            if (tier === "haiku" && approxTokens > HAIKU_MAX_TOKENS) {
+              debug(`${key} ~${approxTokens} tokens exceed haiku window, stepping up to sonnet`);
+              tier = state.tier = "sonnet";
+              model = state.model = idOf("sonnet");
+            }
             debug(`${key} rewrite ${body.model} -> ${model}`);
             applyTier(body, tier, model);
             // Publish what went out. Claude Code's UI shows the row you picked, not the tier
@@ -321,6 +393,10 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
           // from the wire rather than trusted from our own decision log. Claude Code's UI
           // always shows the model it asked for, never the one we rewrote to.
           if (process.env.JEV_DEBUG) {
+            debug(`upstream ${req.method} ${req.url} -> ${up.statusCode}`);
+            if (up.statusCode >= 400) {
+              up.on("data", (c) => debug(`error body: ${c.toString("utf8").slice(0, 300)}`));
+            }
             let seen = false;
             up.on("data", (c) => {
               if (seen) return;

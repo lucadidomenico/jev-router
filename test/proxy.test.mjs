@@ -5,6 +5,8 @@ import {
   sanitizeSchema,
   newTurnPrompt,
   applyTier,
+  foldSystemMessages,
+  inlineToolReferences,
   claudeModels,
   conversationKey,
   sessionOf,
@@ -295,9 +297,127 @@ test("routing to opus leaves thinking and effort intact", () => {
     output_config: { effort: "medium" },
   };
   applyTier(body, "opus");
-  assert.equal(body.model, "claude-opus-5");
+  assert.equal(body.model, "claude-opus-5-5");
   assert.deepEqual(body.thinking, { type: "adaptive" });
   assert.deepEqual(body.output_config, { effort: "medium" });
+});
+
+test("a trailing system message does not hide the user's new turn", () => {
+  // Claude Code 2.1.28x appends its environment block after the prompt.
+  const body = withTools([
+    { role: "user", content: "fix the bug" },
+    { role: "system", content: "# Environment\nPrimary working directory: /repo" },
+  ]);
+  assert.equal(newTurnPrompt(body), "fix the bug");
+});
+
+test("a trailing system message after a tool_result is still a continuation", () => {
+  const body = withTools([
+    { role: "user", content: "fix the bug" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
+    { role: "system", content: "# Environment" },
+  ]);
+  assert.equal(newTurnPrompt(body), null);
+});
+
+test("Claude Code's own background prompts are not routed", () => {
+  const suggestion = withTools([
+    { role: "user", content: "[SUGGESTION MODE: Suggest what the user might naturally type next into the input box.]" },
+  ]);
+  const recap = withTools([
+    { role: "user", content: "The user stepped away and is coming back. Recap in under 40 words, 1-2 sentences." },
+  ]);
+  assert.equal(newTurnPrompt(suggestion), null);
+  assert.equal(newTurnPrompt(recap), null);
+  // The same words later in a real prompt are the user's own.
+  assert.equal(newTurnPrompt(withTools([{ role: "user", content: "explain [SUGGESTION MODE" }])), "explain [SUGGESTION MODE");
+});
+
+test("routing to haiku folds system messages into the preceding user turn", () => {
+  const body = {
+    model: "jev-router",
+    messages: [
+      { role: "user", content: "fix the bug" },
+      { role: "system", content: "# Environment" },
+    ],
+  };
+  applyTier(body, "haiku");
+  assert.deepEqual(body.messages, [
+    { role: "user", content: [{ type: "text", text: "fix the bug" }, { type: "text", text: "# Environment" }] },
+  ]);
+});
+
+test("a system message with no user turn before it becomes a user message", () => {
+  const body = {
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+      { role: "system", content: [{ type: "text", text: "note" }] },
+    ],
+  };
+  foldSystemMessages(body);
+  assert.deepEqual(body.messages[2], { role: "user", content: [{ type: "text", text: "note" }] });
+});
+
+test("routing to sonnet or opus keeps system messages", () => {
+  for (const tier of ["sonnet", "opus"]) {
+    const body = { messages: [{ role: "user", content: "x" }, { role: "system", content: "env" }] };
+    applyTier(body, tier);
+    assert.equal(body.messages[1].role, "system", tier);
+  }
+});
+
+test("tool_addition blocks become up-front tools for models that cannot read them", () => {
+  const body = {
+    tools: [
+      { name: "Bash" },
+      { name: "mcp__docs__read", defer_loading: true },
+      { name: "mcp__docs__write", defer_loading: true },
+      { name: "mcp__mail__send", defer_loading: true },
+    ],
+    messages: [
+      { role: "user", content: "fix the bug" },
+      {
+        role: "system",
+        content: [
+          { type: "tool_addition", tool: { type: "tool_reference", name: "mcp__docs__read" } },
+          { type: "tool_addition", tool: { type: "tool_reference", name: "mcp__docs__write" } },
+        ],
+      },
+      { role: "assistant", content: "ok" },
+      {
+        role: "system",
+        content: [
+          { type: "text", text: "later" },
+          { type: "tool_removal", tool: { type: "tool_reference", name: "mcp__docs__write" } },
+        ],
+      },
+    ],
+  };
+  inlineToolReferences(body);
+  assert.equal(body.tools.find((t) => t.name === "mcp__docs__read").defer_loading, undefined);
+  assert.equal(body.tools.find((t) => t.name === "mcp__docs__write").defer_loading, true, "removed again");
+  assert.equal(body.tools.find((t) => t.name === "mcp__mail__send").defer_loading, true, "never added");
+  assert.equal(body.messages.length, 3, "a system message left empty is dropped");
+  assert.deepEqual(body.messages[2].content, [{ type: "text", text: "later" }]);
+});
+
+test("tool_addition blocks are kept for opus and removed for haiku and sonnet", () => {
+  const make = () => ({
+    tools: [{ name: "mcp__x", defer_loading: true }],
+    messages: [
+      { role: "user", content: "x" },
+      { role: "system", content: [{ type: "tool_addition", tool: { type: "tool_reference", name: "mcp__x" } }] },
+    ],
+  });
+  const opus = applyTier(make(), "opus");
+  assert.equal(opus.messages[1].content[0].type, "tool_addition");
+  for (const tier of ["sonnet", "haiku"]) {
+    const body = applyTier(make(), tier);
+    assert.ok(!JSON.stringify(body.messages).includes("tool_addition"), tier);
+    assert.equal(body.tools[0].defer_loading, undefined, tier);
+  }
 });
 
 test("an unknown tier leaves the request untouched", () => {
@@ -354,4 +474,47 @@ test("the same opening text in two sessions gets two keys", () => {
 test("the key survives metadata that is not JSON", () => {
   const body = { metadata: { user_id: "not-json" }, messages: [{ role: "user", content: "hi" }] };
   assert.doesNotThrow(() => conversationKey(body));
+});
+
+test("a turn routed to haiku steps up to sonnet once it outgrows haiku's window", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      seen.push(JSON.parse(Buffer.concat(chunks)));
+      res.setHeader("content-type", "application/json");
+      res.end('{"id":"msg_1","type":"message"}');
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+
+  const { port, close } = await startProxy({
+    upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
+    route: async () => ({ choice: "claude-haiku-4-5-20251001", confidence: 0.95, ms: 1 }),
+  });
+  t.after(close);
+
+  const send = (body) =>
+    fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const opening = { role: "user", content: `rename a variable ${process.pid}` };
+  await send({ model: "jev-router", tools: [{ name: "Bash" }], messages: [opening] });
+  // The same turn continues after a tool call that returned ~1.2 MB (~300k tokens).
+  await send({
+    model: "jev-router",
+    tools: [{ name: "Bash" }],
+    messages: [
+      opening,
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "x".repeat(1_200_000) }] },
+    ],
+  });
+
+  assert.equal(seen[0].model, "claude-haiku-4-5-20251001");
+  assert.equal(seen[1].model, "claude-sonnet-5");
 });
